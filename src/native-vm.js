@@ -5,6 +5,20 @@ class NativeVM {
         this.isDebug = false; // Disable debugging for production
     }
     
+    /**
+     * Pre-process the code to remove YouTube's short-circuit checks
+     * These checks detect non-browser environments and return error values
+     */
+    preprocessCode(code) {
+        return code
+            // Pattern 1: if (typeof X === "undefined") return Y;
+            .replace(/;\s*if\s*\(\s*typeof\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*===?\s*(?:"undefined"|'undefined')\s*\)\s*return\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*;?/gi, ';')
+            // Pattern 2: if (typeof X === Y[N]) return Z;
+            .replace(/;\s*if\s*\(\s*typeof\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*===?\s*[a-zA-Z_$][a-zA-Z0-9_$]*\[\d+\]\s*\)\s*return\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*;?/gi, ';')
+            // Pattern 3: Remove enhanced_except checks
+            .replace(/;\s*if\s*\([^)]*enhanced_except[^)]*\)\s*return\s+[^;]+;/gi, ';');
+    }
+    
     runInNewContext(context) {
         if (this.isDebug) {
             console.log('Executing code with context:', Object.keys(context));
@@ -16,16 +30,73 @@ class NativeVM {
             const contextKeys = Object.keys(context);
             const contextValues = contextKeys.map(key => context[key]);
             
+            // Pre-process code to remove short-circuit checks
+            const processedCode = this.preprocessCode(this.code);
+            
             // The extracted code defines functions but doesn't call them
             // We need to execute the code and then call the appropriate function
             const wrappedCode = `
-                // Set up context variables
+                // === SIMULATE BROWSER ENVIRONMENT ===
+                // These variables are checked by YouTube's anti-bot code
+                var window = (typeof window !== 'undefined') ? window : {
+                    location: { href: 'https://www.youtube.com', hostname: 'www.youtube.com', protocol: 'https:' },
+                    navigator: { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }
+                };
+                var self = (typeof self !== 'undefined') ? self : window;
+                var globalThis = (typeof globalThis !== 'undefined') ? globalThis : window;
+                var document = (typeof document !== 'undefined') ? document : { 
+                    createElement: function(tag) { 
+                        return { 
+                            style: {}, 
+                            appendChild: function() {}, 
+                            setAttribute: function() {},
+                            getElementsByTagName: function() { return []; }
+                        }; 
+                    },
+                    getElementsByTagName: function() { return []; },
+                    getElementById: function() { return null; },
+                    body: { appendChild: function() {} },
+                    head: { appendChild: function() {} }
+                };
+                var navigator = (typeof navigator !== 'undefined') ? navigator : { 
+                    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    platform: 'Win32',
+                    language: 'en-US'
+                };
+                var location = (typeof location !== 'undefined') ? location : { 
+                    href: 'https://www.youtube.com', 
+                    hostname: 'www.youtube.com',
+                    protocol: 'https:',
+                    origin: 'https://www.youtube.com'
+                };
+                var performance = (typeof performance !== 'undefined') ? performance : { 
+                    now: function() { return Date.now(); },
+                    timing: { navigationStart: Date.now() }
+                };
+                var localStorage = (typeof localStorage !== 'undefined') ? localStorage : { 
+                    getItem: function() { return null; }, 
+                    setItem: function() {},
+                    removeItem: function() {}
+                };
+                var sessionStorage = (typeof sessionStorage !== 'undefined') ? sessionStorage : { 
+                    getItem: function() { return null; }, 
+                    setItem: function() {},
+                    removeItem: function() {}
+                };
+                var crypto = (typeof crypto !== 'undefined') ? crypto : {
+                    getRandomValues: function(arr) { 
+                        for (var i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
+                        return arr;
+                    }
+                };
+                
+                // === SET UP CONTEXT VARIABLES ===
                 ${contextKeys.map((key, index) => `var ${key} = arguments[${index}];`).join('\n')}
                 
-                // Execute the extracted YouTube code (defines functions and variables)
-                ${this.code}
+                // === EXECUTE THE EXTRACTED YOUTUBE CODE ===
+                ${processedCode}
                 
-                // Now call the appropriate function based on context
+                // === CALL THE APPROPRIATE FUNCTION ===
                 ${contextKeys.includes('sig') ? `
                     if (typeof DisTubeDecipherFunc === 'function') {
                         return DisTubeDecipherFunc(sig);
@@ -53,18 +124,31 @@ class NativeVM {
             
         } catch (error) {
             console.error('NativeVM execution failed:', error);
-            console.error('Context:', context);
+            if (this.isDebug) {
+                console.error('Context:', context);
+            }
             
             // Enhanced fallback with non-strict mode
             try {
                 const contextKeys = Object.keys(context);
                 const contextValues = contextKeys.map(key => context[key]);
                 
+                // Pre-process code for fallback too
+                const processedCode = this.preprocessCode(this.code);
+                
                 const fallbackCode = `
+                    // Minimal browser simulation for fallback
+                    var window = window || {};
+                    var self = self || window;
+                    var globalThis = globalThis || window;
+                    var document = document || { createElement: function() { return {}; } };
+                    var navigator = navigator || { userAgent: 'Mozilla/5.0' };
+                    var location = location || { href: 'https://www.youtube.com' };
+                    
                     ${contextKeys.map((key, index) => `var ${key} = arguments[${index}];`).join('\n')}
                     
                     (function() {
-                        ${this.code}
+                        ${processedCode}
                         
                         if (typeof DisTubeDecipherFunc === 'function' && typeof sig !== 'undefined') {
                             return DisTubeDecipherFunc(sig);

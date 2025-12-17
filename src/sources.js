@@ -39,32 +39,47 @@ const generateClientPlaybackNonce = length => {
     return Array.from({ length }, () => CPN_CHARS[Math.floor(Math.random() * CPN_CHARS.length)]).join("");
 };
 
+// Headers for different clients to improve compatibility
+const ANDROID_HEADERS = {
+    "User-Agent": "com.google.android.youtube/19.02.39 (Linux; U; Android 11; en_US; sdk_gphone_x86_arm Build/RSR1.210210.001.A1) gzip",
+    "X-Youtube-Client-Name": "3", // ANDROID = 3
+    "X-Youtube-Client-Version": "19.02.39",
+};
+
+const IOS_HEADERS = {
+    "User-Agent": "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)",
+    "X-Youtube-Client-Name": "5", // IOS = 5
+    "X-Youtube-Client-Version": "19.09.3",
+};
+
 const playerAPI = async (videoId, payload, options) => {
     const url = new URL("https://youtubei.googleapis.com/youtubei/v1/player");
     url.searchParams.set("prettyPrint", "false");
     url.searchParams.set("t", generateClientPlaybackNonce(12));
     url.searchParams.set("id", videoId);
 
+    // Determine which headers to use based on the client
+    const clientName = payload.context?.client?.clientName;
+    let clientHeaders = {};
+    if (clientName === "ANDROID") {
+        clientHeaders = ANDROID_HEADERS;
+    } else if (clientName === "IOS") {
+        clientHeaders = IOS_HEADERS;
+    }
+
     const opts = {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
             "X-Goog-Api-Format-Version": "2",
-            // Include browser headers from options to avoid bot detection
+            ...clientHeaders,
+            // Include custom headers from options
             ...(options.requestOptions?.headers || {})
         },
         body: JSON.stringify(payload),
     };
     if (options.visitorId) opts.headers["X-Goog-Visitor-Id"] = options.visitorId;
     const data = await request(url, opts, true);
-    return data
-    const playErr = utils.playError(data);
-    if (playErr) throw playErr;
-    if (!data.videoDetails || videoId !== data.videoDetails.videoId) {
-        const err = new Error("Malformed response from YouTube");
-        err.response = response;
-        throw err;
-    }
     return data;
 };
 
@@ -126,6 +141,27 @@ const MWEB_CONTEXT = {
     client: {
         clientName: "MWEB",
         clientVersion: "2.20241106.00.00",
+        ...LOCALE,
+    },
+};
+
+// ANDROID client returns direct URLs without needing signature deciphering
+const ANDROID_CONTEXT = {
+    client: {
+        clientName: "ANDROID",
+        clientVersion: "19.02.39",
+        androidSdkVersion: 30,
+        ...LOCALE,
+    },
+};
+
+// IOS client as another fallback with direct URLs
+const IOS_CONTEXT = {
+    client: {
+        clientName: "IOS",
+        clientVersion: "19.09.3",
+        deviceMake: "Apple",
+        deviceModel: "iPhone",
         ...LOCALE,
     },
 };
@@ -290,7 +326,6 @@ const getWatchHTMLRaw = async (id, options) => {
 
 
 export const getData = async (videoId, options = {}) => {
-    console.warn('1');
     utils.applyIPv6Rotations(options);
     utils.applyDefaultHeaders(options);
 
@@ -306,7 +341,6 @@ export const getData = async (videoId, options = {}) => {
     if (!info.html5player) {
         throw Error("Unable to find html5player file");
     }
-    console.warn('2');
     info.html5player = new URL(info.html5player, BASE_URL).toString();
 
     // Use cached playback context if available
@@ -315,7 +349,6 @@ export const getData = async (videoId, options = {}) => {
     }
 
     const playerContext = cachedPlaybackContexts[info.html5player];
-    console.warn('3');
     const payload = {
         context: TVHTML5_CONTEXT,
         videoId,
@@ -327,31 +360,84 @@ export const getData = async (videoId, options = {}) => {
         options.visitorId = await getVisitorDataWithCache(videoId, options, info.html5player);
     }
 
-    // let response = await playerAPI(videoId, payload, options);
-    let isFallback = false
-    console.warn('4');
-    // 1) si viene UNPLAYABLE, probá WEB_EMBEDDED (tu lógica actual)
-    console.warn('trying WEB_EMBEDDED_CONTEXT');
-    response = await playerAPI(videoId, { ...payload, context: WEB_EMBEDDED_CONTEXT }, options);
-    console.warn('WEB_EMBEDDED_CONTEXT', { ...payload, context: WEB_EMBEDDED_CONTEXT });
-
-
-    console.warn('trying MWEB_CONTEXT');
-    const mweb = await playerAPI(videoId, {
-        ...payload,
-        context: MWEB_CONTEXT,               // <-- cambio de client
-        // si querés, podés omitir playbackContext acá;
-        // si lo mantenés, suele funcionar igual
-    }, options);
-
-    // pisamos lo crítico con lo de MWEB (clave del fix)
-    response.playabilityStatus = mweb.playabilityStatus;
-    response.streamingData = mweb.streamingData;
-
-
-    const formatsRaw = parseFormats(response);
-    const formatsObject = await decipherFormats(formatsRaw, info.html5player, options);
-    const formats = Object.values(formatsObject);
+    let isFallback = false;
+    let response;
+    let formatsRaw;
+    let usedClient = null;
+    
+    // Strategy: Try ANDROID first (returns direct URLs without deciphering)
+    // Then fallback to IOS, then to web clients that require deciphering
+    
+    // 1) Try ANDROID client first - returns direct URLs
+    try {
+        const androidResponse = await playerAPI(videoId, { 
+            ...payload, 
+            context: ANDROID_CONTEXT 
+        }, options);
+        
+        if (androidResponse?.playabilityStatus?.status === 'OK' && androidResponse?.streamingData) {
+            response = androidResponse;
+            formatsRaw = parseFormats(response);
+            
+            // Check if we have direct URLs (not signatureCipher)
+            const hasDirectUrls = formatsRaw.some(f => f.url && !f.signatureCipher);
+            if (hasDirectUrls) {
+                usedClient = 'ANDROID';
+            }
+        }
+    } catch (err) {
+        // ANDROID failed, continue to next fallback
+    }
+    
+    // 2) Try IOS client if ANDROID didn't work
+    if (!usedClient) {
+        try {
+            const iosResponse = await playerAPI(videoId, { 
+                ...payload, 
+                context: IOS_CONTEXT 
+            }, options);
+            
+            if (iosResponse?.playabilityStatus?.status === 'OK' && iosResponse?.streamingData) {
+                response = iosResponse;
+                formatsRaw = parseFormats(response);
+                
+                const hasDirectUrls = formatsRaw.some(f => f.url && !f.signatureCipher);
+                if (hasDirectUrls) {
+                    usedClient = 'IOS';
+                }
+            }
+        } catch (err) {
+            // IOS failed, continue to next fallback
+        }
+    }
+    
+    // 3) Fallback to web clients that require deciphering
+    if (!usedClient) {
+        isFallback = true;
+        
+        // Try MWEB
+        const mwebResponse = await playerAPI(videoId, {
+            ...payload,
+            context: MWEB_CONTEXT,
+        }, options);
+        
+        if (mwebResponse?.playabilityStatus?.status === 'OK' && mwebResponse?.streamingData) {
+            response = mwebResponse;
+            usedClient = 'MWEB';
+        } else {
+            // Last resort: WEB_EMBEDDED
+            response = await playerAPI(videoId, { ...payload, context: WEB_EMBEDDED_CONTEXT }, options);
+            usedClient = 'WEB_EMBEDDED';
+        }
+        
+        formatsRaw = parseFormats(response);
+        
+        // Apply deciphering for web clients
+        const formatsObject = await decipherFormats(formatsRaw, info.html5player, options);
+        formatsRaw = Object.values(formatsObject);
+    }
+    
+    const formats = formatsRaw;
     info.formats = formats.filter(format => format && format.url && format.mimeType);
     info.formats = info.formats.map(format => {
         const enhancedFormat = formatUtils.addFormatMeta(format);
